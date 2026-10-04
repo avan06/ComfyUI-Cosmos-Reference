@@ -8,7 +8,10 @@ from comfy.model_base import Anima
 from comfy.model_patcher import ModelPatcher
 from comfy_api.latest import io
 
-MAX_REF_LATENTS = 1
+
+# Autogrow interface while allowing up to two reference latent inputs.
+# Inputs are processed in numeric slot order.
+MAX_REF_LATENTS = 2
 COND_REF_LATENTS_KEY = "ref_latents"
 TEMPORAL_REFERENCE_WRAPPER_KEY = "cosmos_temporal_reference"
 
@@ -30,7 +33,11 @@ class ApplyCosmosReferenceLatent(io.ComfyNode):
                         names=[f"ref_latent_{i}" for i in range(1, MAX_REF_LATENTS + 1)],
                         min=0,
                     ),
-                    tooltip=f"Reference latent(s) for generation. Up to {MAX_REF_LATENTS} latents.",
+                    tooltip=(
+                        "Reference latent inputs for generation. "
+                        "Autogrow exposes the next input after the preceding input is used. "
+                        "Inputs are applied in numeric order, up to 2 latents."
+                    ),
                 ),
             ],
             outputs=[
@@ -41,9 +48,13 @@ class ApplyCosmosReferenceLatent(io.ComfyNode):
     @classmethod
     def execute(cls, **kwargs) -> io.NodeOutput:
         model: ModelPatcher = kwargs["model"]
-        ref_latents: dict[str, dict[str, Any]] = kwargs["ref_latents"]
-        if 'latent' in kwargs:
-            ref_latents['latent_for_compatibility'] = kwargs["latent"]
+        # Copy instead of mutating the mapping owned by the workflow/runtime.
+        ref_latents: dict[str, dict[str, Any]] = dict(kwargs.get("ref_latents") or {})
+        if "latent" in kwargs:
+            ref_latents["latent_for_compatibility"] = kwargs["latent"]
+
+        ordered_ref_latents = _ordered_reference_latents(ref_latents)
+
         m = model.clone()
         model_type = type(m.model)
 
@@ -52,7 +63,7 @@ class ApplyCosmosReferenceLatent(io.ComfyNode):
             process_latent_in = m.get_model_object("process_latent_in")
             m.add_object_patch(
                 "extra_conds",
-                cosmos_extra_conds_reference(extra_conds, process_latent_in, ref_latents),
+                cosmos_extra_conds_reference(extra_conds, process_latent_in, ordered_ref_latents,),
             )
             m.add_wrapper_with_key(
                 comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
@@ -63,15 +74,47 @@ class ApplyCosmosReferenceLatent(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+def _ordered_reference_latents(
+    ref_latents: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return references in stable temporal-slot order.
+
+    Slots are processed as ref_latent_1 followed by ref_latent_2. This avoids
+    depending on dictionary insertion order and prevents a later slot from being
+    used when an earlier slot is absent.
+    """
+    first = ref_latents.get("ref_latent_1")
+    second = ref_latents.get("ref_latent_2")
+    compatibility = ref_latents.get("latent_for_compatibility")
+
+    # Older workflows may provide one reference through the legacy "latent"
+    # input. Use it as the first slot only when the named slot is absent.
+    if first is None and compatibility is not None:
+        first = compatibility
+
+    if second is not None and first is None:
+        raise ValueError(
+            "ref_latent_2 requires ref_latent_1. Connect ref_latent_1 before "
+            "using ref_latent_2."
+        )
+
+    ordered: list[dict[str, Any]] = []
+    if first is not None:
+        ordered.append(first)
+    if second is not None:
+        ordered.append(second)
+    return ordered
+
+
 def cosmos_extra_conds_reference(
     extra_conds: Callable[..., dict],
     process_latent_in: Callable[..., torch.Tensor],
-    ref_latents: dict[str, dict[str, Any]] | None = None,
+    ref_latents: list[dict[str, Any]] | None = None,
 ):
     def _anima_extra_conds_reference(**kwargs):
         out = extra_conds(**kwargs)
-        if ref_latents is not None:
-            latents = [process_latent_in(l["samples"]) for l in ref_latents.values()]
+        if ref_latents:
+            latents = [process_latent_in(latent["samples"]) for latent in ref_latents]
             out[COND_REF_LATENTS_KEY] = comfy.conds.CONDList(latents)
 
         return out
