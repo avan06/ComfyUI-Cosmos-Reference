@@ -1,6 +1,7 @@
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 
 import comfy.conds
 import comfy.patcher_extension
@@ -122,18 +123,51 @@ def cosmos_extra_conds_reference(
     return _anima_extra_conds_reference
 
 
+def _resize_reference_latent(
+    ref: torch.Tensor,
+    target_height: int,
+    target_width: int,
+) -> torch.Tensor:
+    """Resize a reference latent to x's H x W without preserving aspect ratio."""
+    if ref.ndim == 4:
+        ref = ref.unsqueeze(2)
+    elif ref.ndim != 5:
+        raise ValueError(
+            "Reference latent must be 4D [B, C, H, W] or 5D [B, C, T, H, W], "
+            f"but got shape {tuple(ref.shape)}."
+        )
+
+    if ref.shape[-2:] == (target_height, target_width):
+        return ref
+
+    batch, channels, temporal, height, width = ref.shape
+    frames = ref.permute(0, 2, 1, 3, 4).reshape(
+        batch * temporal, channels, height, width
+    )
+    frames = F.interpolate(
+        frames,
+        size=(target_height, target_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return frames.reshape(
+        batch, temporal, channels, target_height, target_width
+    ).permute(0, 2, 1, 3, 4)
+
+
 def cosmos_diffusion_reference_wrapper(executor, *args, **kwargs):
     x: torch.Tensor = args[0]
     x_temporal_dim = x.shape[2]
+    target_height, target_width = x.shape[-2:]
     ref_latents: torch.Tensor | None = kwargs.get(COND_REF_LATENTS_KEY)
 
     newargs = list(args)
 
     if ref_latents is not None:
         for ref in ref_latents:
-            if ref.ndim == 4:
-                ref = ref.unsqueeze(2)
-            x = torch.cat([x, ref.to(dtype=x.dtype, device=x.device)], dim=2)
+            ref = ref.to(dtype=x.dtype, device=x.device)
+            ref = _resize_reference_latent(ref, target_height, target_width)
+            x = torch.cat([x, ref], dim=2)
 
     newargs[0] = x
 
